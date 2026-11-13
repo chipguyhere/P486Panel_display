@@ -15,6 +15,9 @@
  *
  *       display.setRotation(0 | 90 | 180 | 270);
  *
+ *   The picture turns clockwise (the usual Arduino convention), so a panel
+ *   mounted turned a quarter-turn clockwise - USB ports down - wants 270.
+ *
  *   in your sketch BEFORE lv_setup.begin(); omit it and you get 0.
  *
  *   Unlike the 480x480 sibling library, this one renders at the panel's native
@@ -39,6 +42,9 @@
  *   1:1 to pixels at every rotation.  LVGL runs in DIRECT render mode with two
  *   buffers.  Touch arrives in native 720x720 space and needs no scaling, only
  *   the inverse rotation transform.
+ *
+ * Copyright (c) 2024-2026 chipguyhere
+ * MIT License — see LICENSE
  */
 
 #pragma once
@@ -89,10 +95,16 @@ static_assert(_cg_fqbn_contains(ARDUINO_FQBN, "FlashSize=32M"),
     "or define CHIPGUY_ALLOW_ANY_FLASH_SIZE if this sketch deliberately targets a smaller one.");
 #endif
 
+#include <P486Panel_Board.h>                   // shared I2C bus + pin map
 #include <chipguy_P486Panel_display.h>
-#include <chipguy_P486Panel_touch.h>
+#include "chipguy_P486Panel_touch.h"   // this library's own copy (both display libraries ship one)
 #include "esp_cache.h"
 
+// The board owns the shared I2C bus (GPIO7/8); the touch controller is on it,
+// alongside the audio codec, the microphone ADC and the P3 header.  Use
+// board.Wire for any of those — never ::Wire.begin() on other pins.  The
+// relays are board.setRelay(0|1, on).
+static P486Panel_Board board;
 static chipguy_P486Panel_display display;
 
 class lv_setup_class {
@@ -143,6 +155,7 @@ public:
         }
         Serial0.println("Display initialized");
 
+        board.begin();          // the shared I2C bus; idempotent
         _touchscreen.begin();
 
         // Which buffers LVGL draws into depends on the mode begin() chose.
@@ -175,7 +188,7 @@ public:
     }
 
 private:
-    chipguy_P486Panel_touch _touchscreen;
+    chipguy_P486Panel_touch _touchscreen{board.Wire};
     uint16_t *_buf0 = nullptr;
     uint16_t *_buf1 = nullptr;
     size_t _buf_size = 0;
@@ -206,18 +219,11 @@ private:
 
     static void _touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
         auto *self = (lv_setup_class *)lv_indev_get_user_data(indev);
-        esp_lcd_touch_handle_t tp = self->_touchscreen.getHandle();
-        if (!tp) {
-            data->state = LV_INDEV_STATE_RELEASED;
-            return;
-        }
-
+        // Reads up to TOUCH_MAX_POINTS contacts; LVGL's pointer consumes the
+        // first.  A fork that wants multi-touch has the rest in x[1..cnt-1].
         uint16_t x[TOUCH_MAX_POINTS], y[TOUCH_MAX_POINTS];
-        uint16_t strength[TOUCH_MAX_POINTS];
-        uint8_t cnt = 0;
-
-        esp_lcd_touch_read_data(tp);
-        bool pressed = esp_lcd_touch_get_coordinates(tp, x, y, strength, &cnt, TOUCH_MAX_POINTS);
+        uint8_t cnt = self->_touchscreen.readPoints(x, y, TOUCH_MAX_POINTS);
+        bool pressed = cnt > 0;
 
         if (pressed && cnt > 0) {
             // Touch is already in native 720x720 space, the same space LVGL
@@ -227,8 +233,9 @@ private:
             int32_t ty = (int32_t)y[0];
 
             switch (display.getRotation()) {
-                case 90:
-                    // PPA rotated the image 90 degrees CCW; undo that for touch.
+                case 270:
+                    // PPA rotated the image 90 degrees CCW (rotation 270 =
+                    // 270 clockwise); undo that for touch.
                     // Inverse touch transform: sx = 719 - ty, sy = tx
                     data->point.x = 719 - ty;
                     data->point.y = tx;
@@ -237,7 +244,8 @@ private:
                     data->point.x = 719 - tx;
                     data->point.y = 719 - ty;
                     break;
-                case 270:
+                case 90:
+                    // PPA rotated the image 90 degrees CW (PPA 270 CCW).
                     data->point.x = ty;
                     data->point.y = 719 - tx;
                     break;

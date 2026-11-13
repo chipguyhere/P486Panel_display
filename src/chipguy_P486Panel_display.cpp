@@ -1,6 +1,9 @@
 /*
  * ESP32-P4 DSI Display driver with double-buffering support
  * For 720x720 MIPI DSI display
+ *
+ * Copyright (c) 2024-2026 chipguyhere
+ * MIT License — see LICENSE
  */
 
 #ifdef ARDUINO_ESP32P4_DEV
@@ -22,10 +25,6 @@
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
-#include "esp_sleep.h"
-#include "esp_attr.h"
-#include "hal/wdt_hal.h"
-#include "soc/rtc.h"
 #include "hal/lpwdt_ll.h"      // LP_WDT_SWD_WKEY_VALUE
 #include "soc/lp_wdt_struct.h"
 #include <Preferences.h>
@@ -112,12 +111,15 @@ chipguy_P486Panel_display::chipguy_P486Panel_display()
 // 0x10 is not deep enough. The Super Watchdog (rst:0x12, documented as
 // resetting "the digital core and rtc module") is the deepest cause reachable
 // from software and sits between the reset that fails and the EN reset that
-// works; it is verified to fire in ~1.8 s and boot cleanly, but is NOT yet
-// verified to clear an actual black screen.
+// works.  It fires in ~1.8 s and boots cleanly.
 //
-// So: on a soft reset, bring the display up, shut the DSI down cleanly, then
-// promote to a Super Watchdog reset.  Costs one extra ~2 s boot cycle per OTA
-// or watchdog reboot, and nothing at all on a cold boot.
+// So: on a soft reset, bring the display up and then, with the link still
+// running, promote to a Super Watchdog reset.  Measured 2026-08-18 (in the
+// 480x480 sibling library, whose bring-up is the same): 20/20 black panels
+// recovered across 20 soft resets this way.  The same reset after an orderly
+// DSI teardown recovered 0/11, so there is deliberately no teardown.  Costs one
+// extra ~2 s boot cycle per OTA or watchdog reboot, and nothing at all on a
+// cold boot.
 //
 //
 // LOOP SAFETY.  This runs long before the caller has any network up, so a loop
@@ -165,48 +167,14 @@ bool chipguy_P486Panel_display::_shouldPromoteWarmBootReset()
     }
 
     if (promote) {
-        ESP_LOGE(TAG, "warm boot (reset reason %d): will bring DSI up, shut it down "
-                      "cleanly, then promote to an RWDT system+RTC reset", (int)reason);
+        ESP_LOGE(TAG, "warm boot (reset reason %d): will bring DSI up, then promote "
+                      "to a Super Watchdog reset", (int)reason);
     }
     return promote;
 }
 
-// Orderly DSI shutdown: give the hardware back in the reverse of the order it
-// was taken, with the panel held in reset, so nothing is mid-transaction when
-// the reset lands.
-void chipguy_P486Panel_display::_shutdownDsi()
-{
-    bool held = false;
-    if (_dsi_mutex) {
-        held = (xSemaphoreTake(_dsi_mutex, pdMS_TO_TICKS(500)) == pdTRUE);
-        if (!held) {
-            ESP_LOGE(TAG, "shutdownDsi: flush still in flight after 500 ms, "
-                          "tearing down anyway");
-        }
-    }
-
-    gpio_config_t io_conf = {
-        .pin_bit_mask = 1ULL << P486_LCD_RST_PIN,
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    gpio_config(&io_conf);
-    gpio_set_level((gpio_num_t)P486_LCD_RST_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    if (_ppa_client)   { ppa_unregister_client(_ppa_client); _ppa_client = nullptr; }
-    if (_panel_handle) { esp_lcd_panel_del(_panel_handle);   _panel_handle = nullptr; }
-    if (_io_handle)    { esp_lcd_panel_io_del(_io_handle);   _io_handle = nullptr; }
-    if (_mipi_dsi_bus) { esp_lcd_del_dsi_bus(_mipi_dsi_bus); _mipi_dsi_bus = nullptr; }
-    if (_ldo_mipi_phy) { esp_ldo_release_channel(_ldo_mipi_phy); _ldo_mipi_phy = nullptr; }
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    ESP_LOGE(TAG, "DSI shut down cleanly ahead of promoted reset");
-
-    if (held) xSemaphoreGive(_dsi_mutex);
-}
-
-// Fire the RWDT with the RTC domain included.  Does not return in the normal
-// case; if the dog never bites we fall through and the caller carries on.
+// Fire the Super Watchdog (digital core + RTC domain).  Does not return in the
+// normal case; if the dog never bites we fall through and the caller carries on.
 void chipguy_P486Panel_display::_triggerDeepestReset()
 {
     Preferences prefs;
@@ -255,7 +223,9 @@ void chipguy_P486Panel_display::_triggerDeepestReset()
 // This pulse only has to happen first, on a panel nothing else has touched yet.
 //
 // Note the pin is left as a plain input with no internal pull, which is exactly
-// what was tested -- RESETn is held by the board's own pull-up.
+// what was tested.  The main board has no pull-up on RESET (it runs straight
+// from GPIO27 through a 0R to the LCD connector), so while released the line
+// sits wherever the panel module holds it.
 void chipguy_P486Panel_display::_recoveryResetPulse()
 {
     gpio_config_t io_conf = {
@@ -291,8 +261,6 @@ bool chipguy_P486Panel_display::begin()
     // _recoveryResetPulse().
     _recoveryResetPulse();
 
-    if (!_dsi_mutex) _dsi_mutex = xSemaphoreCreateMutex();
-
     const chipguy_lcd_init_cmd_t *init_cmds = p486_init_cmds;
     size_t init_cmds_len = sizeof(p486_init_cmds) / sizeof(p486_init_cmds[0]);
     int8_t lcd_rst_pin = P486_LCD_RST_PIN;
@@ -324,8 +292,6 @@ bool chipguy_P486Panel_display::begin()
     _promote_pending = _quiesce_on_warm_boot && _shouldPromoteWarmBootReset();
 
     // Power on MIPI DSI PHY
-    // Held in a member, not a local: _shutdownDsi() must be able to release the
-    // PHY supply before a promoted reset.
     esp_ldo_channel_handle_t &ldo_mipi_phy = _ldo_mipi_phy;
     esp_ldo_channel_config_t ldo_mipi_phy_config = {
         .chan_id = MIPI_DSI_PHY_PWR_LDO_CHAN,
@@ -374,7 +340,7 @@ bool chipguy_P486Panel_display::begin()
             .vsync_back_porch = P486_VSYNC_BACK_PORCH,
             .vsync_front_porch = P486_VSYNC_FRONT_PORCH,
         },
-        .virtual_v_pixels = 0,  // No virtual scrolling, same as display height
+        .virtual_v_pixels = _fb_rows,  // 0 = 720; taller for the terminal's scroll ring
         .flags = {
             .use_dma2d = false,
             .disable_lp = false,
@@ -474,24 +440,20 @@ bool chipguy_P486Panel_display::begin()
     // Doing it at the top of begin() was measured NOT to prevent a black
     // bring-up in the field: at that point the DSI hardware is still running
     // from the previous firmware image with no software owning it, so the reset
-    // lands mid-stream.  Here the link has been brought up properly, is owned,
-    // and _shutdownDsi() hands it back in reverse order with the panel held in
-    // reset -- so nothing is in flight when the RTC domain goes.
+    // lands mid-stream.  Here the link has been brought up properly and is
+    // owned.  It is NOT torn down first: a teardown before the reset was
+    // measured to prevent the recovery (0/11, against 20/20 without).
     //
     // Costs one extra ~1.5 s boot cycle per soft reset.  The next boot comes
     // back as ESP_RST_WDT with the NVS flag set, so it skips this and brings
     // the display up for real.
     if (_promote_pending) {
         _promote_pending = false;
-        // NO teardown here -- see chipguy_P486Panel_480display: a promoted
-        // reset from a running link recovered a black panel 20/20, while the
-        // same reset after _shutdownDsi() recovered 0/11.
         _triggerDeepestReset();     // normally does not return
-        // Only reached if the watchdog never fired.  The DSI is now torn down, so
-        // report failure and let the caller's error path deal with it rather
-        // than returning a display that no longer exists.
-        ESP_LOGE(TAG, "promoted reset did not happen and DSI is torn down; "
-                      "reporting init failure");
+        // Only reached if the watchdog never fired.  Report failure so the
+        // caller's error path (resetAndRestart) reboots rather than carrying on
+        // with a boot that was meant to be thrown away.
+        ESP_LOGE(TAG, "promoted reset did not happen; reporting init failure");
         return false;
     }
 
@@ -550,10 +512,14 @@ void chipguy_P486Panel_display::setActiveFramebuffer(uint8_t index, bool wait_fo
 
 void chipguy_P486Panel_display::setRotation(int degrees)
 {
+    // 1/2/3 alias 90/180/270.  Rotation turns the picture clockwise (the usual
+    // Arduino display convention); the PPA's angles are counter-clockwise, so
+    // 90 and 270 swap on the way in.
+    if (degrees >= 1 && degrees <= 3) degrees *= 90;
     switch (degrees) {
-        case 90:  _rotation = PPA_SRM_ROTATION_ANGLE_90;  break;
+        case 90:  _rotation = PPA_SRM_ROTATION_ANGLE_270; break;
         case 180: _rotation = PPA_SRM_ROTATION_ANGLE_180; break;
-        case 270: _rotation = PPA_SRM_ROTATION_ANGLE_270; break;
+        case 270: _rotation = PPA_SRM_ROTATION_ANGLE_90;  break;
         default:  _rotation = PPA_SRM_ROTATION_ANGLE_0; degrees = 0; break;
     }
 
@@ -589,22 +555,12 @@ uint16_t *chipguy_P486Panel_display::getDrawBuffer(uint8_t index)
 
 void chipguy_P486Panel_display::rotateAndFlip(uint8_t draw_buf_index, uint8_t target_fb_index)
 {
-    // Serialise against _shutdownDsi(), which deletes the handles used below.
-    // The restart hook fires from another task while the renderer is flushing,
-    // so without this a teardown can land mid-flush and panic -- and a panic
-    // reboots with the DSI link live, exactly what the hook exists to prevent.
-    // Short timeout: if a teardown is under way, drop the frame.
-    if (_dsi_mutex && xSemaphoreTake(_dsi_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-        return;
-    }
-
-    do {
-    if (!_ppa_client || draw_buf_index >= 2) break;
+    if (!_ppa_client || draw_buf_index >= 2) return;
     uint16_t *src = _draw_buffers[draw_buf_index];
-    if (!src) break;
+    if (!src) return;
 
     uint16_t *target_fb = getFramebuffer(target_fb_index);
-    if (!target_fb) break;
+    if (!target_fb) return;
 
     // Flush CPU cache for the source buffer the renderer just wrote
     esp_cache_msync(src, P486_FB_SIZE, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
@@ -643,7 +599,7 @@ void chipguy_P486Panel_display::rotateAndFlip(uint8_t draw_buf_index, uint8_t ta
     esp_err_t ret = ppa_do_scale_rotate_mirror(_ppa_client, &srm_config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "PPA rotate failed: %s", esp_err_to_name(ret));
-        break;
+        return;
     }
 
     // Invalidate cache for the target buffer (PPA wrote via DMA)
@@ -651,9 +607,14 @@ void chipguy_P486Panel_display::rotateAndFlip(uint8_t draw_buf_index, uint8_t ta
 
     // Switch display to show this framebuffer
     setActiveFramebuffer(target_fb_index, false);
-    } while (0);
+}
 
-    if (_dsi_mutex) xSemaphoreGive(_dsi_mutex);
+bool chipguy_P486Panel_display::setScanLayout(uint16_t top, uint16_t ring, uint16_t window,
+                                              uint16_t offset)
+{
+    if (!_panel_handle) return false;
+    chipguy_lcd_dpi_layout_t l = { top, ring, window, offset };
+    return chipguy_lcd_dpi_panel_set_layout(_panel_handle, &l) == ESP_OK;
 }
 
 bool chipguy_P486Panel_display::waitVsync(uint32_t timeout_ms)

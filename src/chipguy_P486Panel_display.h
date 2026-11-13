@@ -1,6 +1,9 @@
 /*
  * ESP32-P4 DSI Display driver with double-buffering support
  * For 720x720 MIPI DSI display
+ *
+ * Copyright (c) 2024-2026 chipguyhere
+ * MIT License — see LICENSE
  */
 
 #pragma once
@@ -24,11 +27,10 @@
 
 #include <Arduino.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_io.h"
-#include "esp_ldo_regulator.h"   // the DSI PHY supply, kept so it can be released
+#include "esp_ldo_regulator.h"   // the DSI PHY supply
 #include "driver/ppa.h"
 
 
@@ -44,10 +46,11 @@ public:
     // A soft reset is a CPU-only reset (rst:0x0C), which leaves whatever latches
     // this panel's black-screen fault untouched -- measured: only a reset that
     // includes the RTC domain clears it.  When enabled, a boot that followed a
-    // soft reset brings the DSI up, shuts it down cleanly, then promotes itself
-    // to an RWDT system+RTC reset; the boot after that runs normally.
+    // soft reset brings the display up and then, with the link still running,
+    // promotes itself to a Super Watchdog reset (digital core + RTC domain);
+    // the boot after that runs normally.  Measured: 20/20 recoveries.
     //
-    // Costs one extra ~1.5 s boot cycle per soft reset and nothing on a cold
+    // Costs one extra ~1.5-2 s boot cycle per soft reset and nothing on a cold
     // boot.  Guarded against boot loops by both the reset reason and an NVS
     // flag.  Call before begin() to disable.
     // Runs in addition to the RESETn recovery pulse at the top of begin(), which
@@ -81,7 +84,8 @@ public:
     // BEFORE begin().  Afterwards you may freely change among angles only if
     // begin() already put you in the rotating mode; asking to start rotating
     // after a rotation-0 begin() is rejected and logged, since the draw buffers
-    // do not exist.  Accepts 0, 90, 180, 270 (counter-clockwise).
+    // do not exist.  Accepts 0, 90, 180, 270 (1/2/3 alias 90/180/270); the
+    // picture turns clockwise, the usual Arduino convention.
     void setRotation(int degrees);
     int  getRotation() const;
 
@@ -116,6 +120,20 @@ public:
     uint32_t getFrameCount();
     uint32_t getUnderrunCount();
 
+    // --- Hardware scrolling (used by chipguy_P486Panel_terminal) -------------
+    // Make each framebuffer `rows` rows tall instead of 720, so a scrolling
+    // ring can keep rows off screen.  Call BEFORE begin(); 0 means 720.
+    void setFramebufferRows(uint16_t rows) { _fb_rows = rows; }
+    uint16_t framebufferRows() const { return _fb_rows ? _fb_rows : 720; }
+
+    // How the panel reads the active framebuffer each frame: a frozen top band
+    // (rows 0..top-1), `window` rows from a ring of `ring` rows starting at row
+    // `top` (beginning `offset` rows in, wrapping), then the frozen bottom band
+    // from row top+ring.  Takes effect at the next frame boundary, so changing
+    // only `offset` scrolls without tearing.  Plain: (0, 720, 720, 0).
+    // Returns false if it doesn't fit the framebuffer.
+    bool setScanLayout(uint16_t top, uint16_t ring, uint16_t window, uint16_t offset);
+
 private:
     // Drive RESETn low 100 ms, high 100 ms, release the pin (input, no pull),
     // then 100 ms of quiet -- the sequence measured to recover panels that stay
@@ -124,11 +142,8 @@ private:
     // afterwards, unchanged; this only has to happen first.
     void _recoveryResetPulse();
     bool _shouldPromoteWarmBootReset();
-    void _shutdownDsi();
     void _triggerDeepestReset();
 
-    // Serialises the flush path against _shutdownDsi(); see scaleAndFlip().
-    SemaphoreHandle_t _dsi_mutex = nullptr;
     bool _quiesce_on_warm_boot = true;
     bool _promote_pending = false;
     esp_ldo_channel_handle_t _ldo_mipi_phy = nullptr;
@@ -140,6 +155,7 @@ private:
     ppa_srm_rotation_angle_t _rotation = PPA_SRM_ROTATION_ANGLE_0;
     int _rotation_degrees = 0;
     bool _began = false;
+    uint16_t _fb_rows = 0;
 };
 
 #endif // ARDUINO_ESP32P4_DEV

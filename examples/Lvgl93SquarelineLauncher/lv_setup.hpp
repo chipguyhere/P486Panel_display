@@ -21,7 +21,7 @@
  *  handles all four orientations; to rotate, uncomment the setRotation() line
  *  in the .ino, before lv_setup.begin():
  *
- *      display.setRotation(90);   // 0, 90, 180 or 270
+ *      display.setRotation(270);   // 0, 90, 180 or 270
  *
  *  Unlike the 480 sibling - where the PPA is always busy scaling anyway and
  *  rotation rides along for free - here rotation genuinely costs something,
